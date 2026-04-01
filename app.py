@@ -9,13 +9,11 @@ from googleads import ad_manager
 st.set_page_config(page_title="Ad Manager - Mobile Apps", page_icon="📱", layout="centered")
 
 st.title("📱 Google Ad Manager — Add Mobile Apps")
-st.markdown("Upload a CSV with your app bundle IDs to register them in Ad Manager.")
+st.markdown("Upload a CSV with one bundle ID per row to register apps in Ad Manager.")
 
 
 def get_ad_manager_client():
-    """Initialize Ad Manager client from Streamlit secrets or local yaml."""
     if "gcp_service_account" in st.secrets:
-        # Running on Streamlit Cloud — write secrets to a temp file
         sa = dict(st.secrets["gcp_service_account"])
         network_code = st.secrets["ad_manager"]["network_code"]
 
@@ -36,50 +34,51 @@ def get_ad_manager_client():
         os.unlink(yaml_path)
         return client, key_path
     else:
-        # Local dev — use googleads.yaml in project directory
         yaml_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "googleads.yaml")
         return ad_manager.AdManagerClient.LoadFromStorage(path=yaml_path), None
 
 
-def add_apps(apps_data, progress_bar, status_text):
+def add_apps(bundle_ids, platform, progress_bar, status_text):
     client, key_path = get_ad_manager_client()
     svc = client.GetService("MobileApplicationService", version="v202602")
 
+    app_store = "GOOGLE_PLAY" if platform == "Android" else "APPLE_ITUNES"
+
     created, skipped = [], []
 
-    for i, app in enumerate(apps_data):
-        progress_bar.progress((i + 1) / len(apps_data))
-        status_text.text(f"Processing {i + 1}/{len(apps_data)}: {app['app_store_id']}")
+    for i, bundle_id in enumerate(bundle_ids):
+        progress_bar.progress((i + 1) / len(bundle_ids))
+        status_text.text(f"Processing {i + 1}/{len(bundle_ids)}: {bundle_id}")
 
         try:
             result = svc.createMobileApplications([{
-                "displayName": app["display_name"],
-                "appStores": [app["app_store"]],
-                "appStoreId": app["app_store_id"],
+                "displayName": bundle_id,
+                "appStores": [app_store],
+                "appStoreId": bundle_id,
             }])
             if result:
                 created.append({
-                    "display_name": app["display_name"],
-                    "app_store": app["app_store"],
-                    "app_store_id": app["app_store_id"],
-                    "id": result[0]["id"],
+                    "bundle_id": bundle_id,
+                    "ad_manager_id": result[0]["id"],
+                    "platform": platform,
                 })
         except Exception as e:
             err = str(e)
             if "NON_UNIQUE_STORE_ID" in err:
-                reason = "Already exists"
+                reason = "Already exists in Ad Manager"
             elif "MISSING_APP_STORE_ENTRY" in err:
-                reason = "Not found in store"
+                reason = f"Not found in {'Google Play' if platform == 'Android' else 'App Store'}"
             elif "MISSING_UAM_DATA" in err:
-                reason = "Missing store data"
+                reason = "Missing store metadata"
             elif "MANUAL_APP_NAME_TOO_LONG" in err:
-                reason = "Display name too long"
+                reason = "Bundle ID too long (max 80 chars)"
+            elif "PUBLISHER_HAS_TOO_MANY_ACTIVE_APPS" in err:
+                reason = "Account app limit reached"
             else:
-                reason = err[:100]
+                reason = err[:120]
             skipped.append({
-                "display_name": app["display_name"],
-                "app_store": app["app_store"],
-                "app_store_id": app["app_store_id"],
+                "bundle_id": bundle_id,
+                "platform": platform,
                 "reason": reason,
             })
 
@@ -89,82 +88,101 @@ def add_apps(apps_data, progress_bar, status_text):
     return created, skipped
 
 
-# --- CSV format instructions ---
-with st.expander("CSV format"):
+# --- Instructions ---
+with st.expander("How to use"):
     st.markdown("""
-Your CSV must have these columns:
+1. Select the platform (Android or iOS)
+2. Upload a CSV file with **one bundle ID per row** — no header needed
 
-| display_name | app_store | app_store_id |
-|---|---|---|
-| My Android App | GOOGLE_PLAY | com.example.app |
-| My iOS App | APPLE_ITUNES | com.example.iosapp |
+**Example CSV for Android:**
+```
+com.example.app
+com.another.game
+com.mygame.puzzle
+```
 
-**`app_store` values:** `GOOGLE_PLAY` or `APPLE_ITUNES`
-
-**`app_store_id`:**
-- Android → package name (e.g. `com.example.app`)
-- iOS → bundle ID (e.g. `com.example.app`)
+**Example CSV for iOS:**
+```
+com.example.iosapp
+com.another.iosgame
+```
 """)
-    sample = "display_name,app_store,app_store_id\nMy Android App,GOOGLE_PLAY,com.example.app\nMy iOS App,APPLE_ITUNES,com.example.iosapp\n"
-    st.download_button("Download sample CSV", sample, file_name="sample_apps.csv", mime="text/csv")
+    col1, col2 = st.columns(2)
+    with col1:
+        sample_android = "com.example.app\ncom.another.game\ncom.mygame.puzzle\n"
+        st.download_button("Download Android sample", sample_android, file_name="android_apps.csv", mime="text/csv")
+    with col2:
+        sample_ios = "com.example.iosapp\ncom.another.iosgame\n"
+        st.download_button("Download iOS sample", sample_ios, file_name="ios_apps.csv", mime="text/csv")
+
+# --- Platform selector ---
+platform = st.radio("Platform", ["Android", "iOS"], horizontal=True)
 
 # --- File upload ---
-uploaded_file = st.file_uploader("Upload your CSV", type="csv")
+uploaded_file = st.file_uploader("Upload CSV with bundle IDs", type="csv")
 
 if uploaded_file:
-    content = uploaded_file.read().decode("utf-8")
-    reader = csv.DictReader(io.StringIO(content))
+    content = uploaded_file.read().decode("utf-8").strip()
 
-    apps = []
-    errors = []
-    for i, row in enumerate(reader, start=2):
-        missing = [c for c in ["display_name", "app_store", "app_store_id"] if c not in row or not row[c].strip()]
-        if missing:
-            errors.append(f"Row {i}: missing columns {missing}")
-            continue
-        if row["app_store"].strip() not in ("GOOGLE_PLAY", "APPLE_ITUNES"):
-            errors.append(f"Row {i}: invalid app_store value '{row['app_store']}' (must be GOOGLE_PLAY or APPLE_ITUNES)")
-            continue
-        apps.append({
-            "display_name": row["display_name"].strip(),
-            "app_store": row["app_store"].strip(),
-            "app_store_id": row["app_store_id"].strip(),
-        })
+    # Parse: support both plain list and single-column CSV with or without header
+    lines = [l.strip() for l in content.splitlines() if l.strip()]
 
-    if errors:
-        st.error("CSV has errors:\n" + "\n".join(errors))
+    # Strip surrounding quotes if present
+    lines = [l.strip('"').strip("'") for l in lines]
+
+    # Drop header row if it looks like a label (no dots = not a bundle ID)
+    if lines and "." not in lines[0]:
+        lines = lines[1:]
+
+    # Remove any extra columns if user uploaded multi-column CSV
+    bundle_ids = [l.split(",")[0].strip().strip('"') for l in lines if l]
+    bundle_ids = [b for b in bundle_ids if b]
+
+    if not bundle_ids:
+        st.error("No bundle IDs found in the file.")
     else:
-        android = sum(1 for a in apps if a["app_store"] == "GOOGLE_PLAY")
-        ios = sum(1 for a in apps if a["app_store"] == "APPLE_ITUNES")
-        st.success(f"Loaded **{len(apps)} apps** — {android} Android, {ios} iOS")
+        st.success(f"Loaded **{len(bundle_ids)} bundle IDs** for **{platform}**")
+
+        with st.expander("Preview bundle IDs"):
+            st.code("\n".join(bundle_ids[:20]) + ("\n..." if len(bundle_ids) > 20 else ""))
 
         if st.button("Add to Ad Manager", type="primary"):
             progress_bar = st.progress(0)
             status_text = st.empty()
 
-            with st.spinner("Adding apps..."):
-                created, skipped = add_apps(apps, progress_bar, status_text)
+            created, skipped = add_apps(bundle_ids, platform, progress_bar, status_text)
 
             status_text.empty()
             progress_bar.progress(1.0)
 
-            st.markdown(f"### Results: {len(created)} created, {len(skipped)} skipped")
+            # --- Summary ---
+            total = len(bundle_ids)
+            st.markdown("---")
+            col1, col2, col3 = st.columns(3)
+            col1.metric("Total", total)
+            col2.metric("Created", len(created), delta=f"+{len(created)}")
+            col3.metric("Skipped", len(skipped))
 
+            # --- Created ---
             if created:
-                st.markdown("#### ✅ Created")
-                st.dataframe(
-                    created,
-                    column_order=["display_name", "app_store", "app_store_id", "id"],
-                    use_container_width=True,
-                )
-                created_csv = "display_name,app_store,app_store_id,ad_manager_id\n" + \
-                    "\n".join(f"{r['display_name']},{r['app_store']},{r['app_store_id']},{r['id']}" for r in created)
-                st.download_button("Download created apps CSV", created_csv, file_name="created_apps.csv", mime="text/csv")
+                st.markdown("### ✅ Successfully Created")
+                st.dataframe(created, use_container_width=True)
+                created_csv = "bundle_id,platform,ad_manager_id\n" + \
+                    "\n".join(f"{r['bundle_id']},{r['platform']},{r['ad_manager_id']}" for r in created)
+                st.download_button("Download created apps", created_csv, file_name="created_apps.csv", mime="text/csv")
 
+            # --- Skipped ---
             if skipped:
-                st.markdown("#### ⚠️ Skipped")
-                st.dataframe(
-                    skipped,
-                    column_order=["display_name", "app_store", "app_store_id", "reason"],
-                    use_container_width=True,
-                )
+                st.markdown("### ⚠️ Skipped / Errors")
+                st.dataframe(skipped, use_container_width=True)
+
+                # Group errors by reason for summary
+                from collections import Counter
+                reasons = Counter(r["reason"] for r in skipped)
+                st.markdown("**Error summary:**")
+                for reason, count in reasons.most_common():
+                    st.markdown(f"- **{reason}** — {count} app(s)")
+
+                skipped_csv = "bundle_id,platform,reason\n" + \
+                    "\n".join(f"{r['bundle_id']},{r['platform']},{r['reason']}" for r in skipped)
+                st.download_button("Download skipped apps", skipped_csv, file_name="skipped_apps.csv", mime="text/csv")
