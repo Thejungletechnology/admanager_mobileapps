@@ -1,0 +1,6 @@
+googleads.yaml
+jt-ssp-19a40eb6f3c8.json
+*.json
+__pycache__/
+*.pyc
+.env
